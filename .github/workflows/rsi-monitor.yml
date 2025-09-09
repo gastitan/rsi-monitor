@@ -2,12 +2,16 @@ name: RSI Stock Monitor
 
 on:
   schedule:
-    # Ejecutar cada 30 minutos durante horario de mercado US (9:30 AM - 4:00 PM ET)
-    # Convertido a UTC: 2:30 PM - 9:00 PM (horario estándar) o 1:30 PM - 8:00 PM (horario de verano)
-    # Usando horario UTC más amplio para cubrir ambos casos
-    - cron: '30,0 13-21 * * 1-5'  # Cada 30 min, 1:30 PM - 9:00 PM UTC, Lunes-Viernes
+    # 3 ejecuciones por día durante horario de mercado US
+    # 11:00 AM ET = 3:00 PM UTC (horario estándar) / 2:00 PM UTC (horario verano)
+    # 1:00 PM ET = 5:00 PM UTC (horario estándar) / 4:00 PM UTC (horario verano)  
+    # 3:00 PM ET = 7:00 PM UTC (horario estándar) / 6:00 PM UTC (horario verano)
+    # Usando horario más amplio para cubrir ambos casos
+    - cron: '0 15 * * 1-5'    # 11:00 AM ET aproximado
+    - cron: '0 17 * * 1-5'    # 1:00 PM ET aproximado  
+    - cron: '0 19 * * 1-5'    # 3:00 PM ET aproximado
   
-  # Permitir ejecución manual desde GitHub
+  # Permitir ejecución manual
   workflow_dispatch:
 
 jobs:
@@ -36,12 +40,12 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         
-    - name: Run RSI Monitor
+    - name: Run Value Investment Monitor
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       run: |
-        python rsi_monitor_github.py
+        python value_investment_monitor.py
         
     - name: Upload logs (optional)
       if: always()
