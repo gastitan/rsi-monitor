@@ -2,21 +2,25 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
-import time
+import os
 from datetime import datetime
+import pytz
 import logging
 
 # Configuración de logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Para GitHub Actions logs
+        logging.FileHandler('rsi_monitor.log')  # Archivo de log opcional
+    ]
+)
 
 class RSIMonitor:
     def __init__(self, bot_token, chat_id):
         """
-        Inicializa el monitor RSI
-        
-        Args:
-            bot_token (str): Token del bot de Telegram
-            chat_id (str): ID del chat donde enviar las notificaciones
+        Inicializa el monitor RSI para GitHub Actions
         """
         self.bot_token = bot_token
         self.chat_id = chat_id
@@ -25,13 +29,6 @@ class RSIMonitor:
     def calculate_rsi(self, prices, period=14):
         """
         Calcula el RSI (Relative Strength Index)
-        
-        Args:
-            prices (pd.Series): Serie de precios
-            period (int): Período para el cálculo del RSI (default: 14)
-            
-        Returns:
-            float: Valor del RSI
         """
         delta = prices.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -45,13 +42,6 @@ class RSIMonitor:
     def get_stock_data(self, symbol, period="3mo"):
         """
         Obtiene datos históricos de la acción
-        
-        Args:
-            symbol (str): Símbolo de la acción
-            period (str): Período de datos (default: "3mo")
-            
-        Returns:
-            pd.DataFrame: Datos históricos o None si hay error
         """
         try:
             stock = yf.Ticker(symbol)
@@ -69,12 +59,6 @@ class RSIMonitor:
     def send_telegram_message(self, message):
         """
         Envía mensaje por Telegram
-        
-        Args:
-            message (str): Mensaje a enviar
-            
-        Returns:
-            bool: True si se envió correctamente, False en caso contrario
         """
         try:
             payload = {
@@ -86,26 +70,46 @@ class RSIMonitor:
             response = requests.post(self.telegram_url, data=payload, timeout=10)
             
             if response.status_code == 200:
-                logging.info("Mensaje enviado correctamente por Telegram")
+                logging.info("✅ Mensaje enviado correctamente por Telegram")
                 return True
             else:
-                logging.error(f"Error enviando mensaje: {response.status_code} - {response.text}")
+                logging.error(f"❌ Error enviando mensaje: {response.status_code}")
                 return False
                 
         except Exception as e:
-            logging.error(f"Error enviando mensaje por Telegram: {e}")
+            logging.error(f"❌ Error enviando mensaje por Telegram: {e}")
             return False
+    
+    def is_market_hours(self):
+        """
+        Verifica si estamos en horario de mercado (más permisivo para GitHub Actions)
+        """
+        try:
+            ny_tz = pytz.timezone('America/New_York')
+            now_ny = datetime.now(ny_tz)
+            
+            # Verificar día de la semana
+            weekday = now_ny.weekday()
+            if weekday >= 5:  # Weekend
+                logging.info(f"🔒 Fin de semana - Mercado cerrado")
+                return False
+            
+            # Horario extendido para GitHub Actions (9:00 AM - 4:30 PM ET)
+            # Esto da margen para diferencias de cron timing
+            if 9 <= now_ny.hour < 16 or (now_ny.hour == 16 and now_ny.minute <= 30):
+                logging.info(f"📈 Horario de mercado - Hora NY: {now_ny.strftime('%H:%M:%S')}")
+                return True
+            else:
+                logging.info(f"🔒 Fuera de horario - Hora NY: {now_ny.strftime('%H:%M:%S')}")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Error verificando horario: {e}")
+            return True  # En caso de error, ejecutar anyway
     
     def check_rsi_alert(self, symbol, rsi_threshold=30):
         """
-        Verifica si el RSI está por debajo del umbral y envía alerta
-        
-        Args:
-            symbol (str): Símbolo de la acción
-            rsi_threshold (float): Umbral del RSI para la alerta
-            
-        Returns:
-            dict: Información sobre el resultado del chequeo
+        Verifica RSI y envía alerta si es necesario
         """
         data = self.get_stock_data(symbol)
         
@@ -135,109 +139,80 @@ class RSIMonitor:
 
 📊 <b>Acción:</b> {symbol}
 📈 <b>RSI (14):</b> {round(rsi, 2)}
-💰 <b>Precio actual:</b> ${round(current_price, 2)}
+💰 <b>Precio:</b> ${round(current_price, 2)}
 ⏰ <b>Fecha:</b> {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
 
-⚠️ El RSI está por debajo de {rsi_threshold}, indicando posible sobreventa.
+⚠️ RSI por debajo de {rsi_threshold} - Posible sobreventa
+🤖 <i>Enviado desde GitHub Actions</i>
                 """.strip()
                 
                 if self.send_telegram_message(message):
                     result['alert_sent'] = True
-                    logging.info(f"Alerta enviada para {symbol} - RSI: {round(rsi, 2)}")
+                    logging.info(f"🚨 Alerta enviada para {symbol} - RSI: {round(rsi, 2)}")
+            else:
+                logging.info(f"✅ {symbol}: RSI={round(rsi, 2)} (OK)")
             
             return result
             
         except Exception as e:
-            logging.error(f"Error calculando RSI para {symbol}: {e}")
+            logging.error(f"❌ Error calculando RSI para {symbol}: {e}")
             return {
                 'symbol': symbol,
                 'success': False,
                 'error': str(e)
             }
     
-    def monitor_stocks(self, stock_list, rsi_threshold=30, check_interval=1800):
+    def run_single_check(self, stock_list, rsi_threshold=30):
         """
-        Monitorea una lista de acciones solo durante el horario de mercado
+        Ejecuta una sola verificación (ideal para GitHub Actions)
+        """
+        # Verificar si estamos en horario de mercado
+        if not self.is_market_hours():
+            logging.info("⏭️ Ejecución omitida - Fuera del horario de mercado")
+            return
         
-        Args:
-            stock_list (list): Lista de símbolos de acciones
-            rsi_threshold (float): Umbral del RSI para alertas
-            check_interval (int): Intervalo entre chequeos en segundos (default: 1800 = 30 min)
-        """
-        logging.info(f"🚀 Iniciando monitoreo inteligente de {len(stock_list)} acciones")
+        logging.info(f"🚀 Iniciando verificación RSI de {len(stock_list)} acciones")
         logging.info(f"📊 Umbral RSI: {rsi_threshold}")
-        logging.info(f"⏱️  Intervalo: {check_interval//60} minutos")
-        logging.info(f"🕘 Solo durante horario de mercado: 9:30 AM - 4:00 PM ET (Lunes-Viernes)")
         
-        while True:
-            try:
-                # Verificar si el mercado está abierto
-                if not self.is_market_open():
-                    next_open = self.get_next_market_open()
-                    ny_tz = pytz.timezone('America/New_York')
-                    now_ny = datetime.now(ny_tz)
-                    
-                    wait_time = (next_open - now_ny).total_seconds()
-                    wait_hours = wait_time // 3600
-                    wait_minutes = (wait_time % 3600) // 60
-                    
-                    logging.info(f"💤 Mercado cerrado. Próxima apertura: {next_open.strftime('%A %d/%m/%Y a las %H:%M ET')}")
-                    logging.info(f"⏳ Esperando {int(wait_hours)}h {int(wait_minutes)}m...")
-                    
-                    # Enviar notificación de estado si es la primera vez
-                    status_message = f"""
-🌙 <b>Monitor RSI - Mercado Cerrado</b>
+        results = []
+        alerts_count = 0
+        
+        for symbol in stock_list:
+            logging.info(f"🔍 Verificando {symbol}...")
+            result = self.check_rsi_alert(symbol, rsi_threshold)
+            results.append(result)
+            
+            if result.get('alert_sent', False):
+                alerts_count += 1
+        
+        # Resumen
+        successful = len([r for r in results if r['success']])
+        logging.info(f"📋 Resumen: {successful}/{len(stock_list)} exitosos, {alerts_count} alertas enviadas")
+        
+        # Enviar resumen si hay alertas o es la primera ejecución del día
+        if alerts_count > 0:
+            summary_message = f"""
+📊 <b>Resumen RSI Monitor</b>
 
-📅 <b>Próxima apertura:</b> {next_open.strftime('%A %d/%m/%Y')}
-🕘 <b>Hora:</b> 9:30 AM ET
-⏳ <b>Tiempo restante:</b> {int(wait_hours)}h {int(wait_minutes)}m
+✅ <b>Acciones verificadas:</b> {successful}/{len(stock_list)}
+🚨 <b>Alertas enviadas:</b> {alerts_count}
+⏰ <b>Hora:</b> {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
 
-💤 El monitor se pausará hasta la apertura del mercado.
-                    """.strip()
-                    
-                    self.send_telegram_message(status_message)
-                    
-                    # Esperar hasta la apertura (verificar cada hora por si acaso)
-                    sleep_time = min(wait_time, 3600)  # Máximo 1 hora
-                    time.sleep(int(sleep_time))
-                    continue
-                
-                # El mercado está abierto, proceder con el monitoreo
-                logging.info("📈 --- Iniciando ronda de chequeos ---")
-                results = []
-                
-                for symbol in stock_list:
-                    logging.info(f"🔍 Verificando {symbol}...")
-                    result = self.check_rsi_alert(symbol, rsi_threshold)
-                    results.append(result)
-                    
-                    # Pausa entre consultas para evitar rate limiting
-                    time.sleep(3)
-                
-                # Resumen de la ronda
-                successful = len([r for r in results if r['success']])
-                alerts_sent = len([r for r in results if r.get('alert_sent', False)])
-                
-                logging.info(f"✅ Ronda completada: {successful}/{len(stock_list)} exitosos, {alerts_sent} alertas enviadas")
-                
-                # Verificar si el mercado sigue abierto antes de esperar
-                if self.is_market_open():
-                    logging.info(f"⏰ Esperando {check_interval//60} minutos hasta el próximo chequeo...")
-                    time.sleep(check_interval)
-                else:
-                    logging.info("🔒 Mercado se cerró durante la ejecución")
-                
-            except KeyboardInterrupt:
-                logging.info("❌ Monitoreo detenido por el usuario")
-                break
-            except Exception as e:
-                logging.error(f"💥 Error en el monitoreo: {e}")
-                time.sleep(300)  # Esperar 5 minutos antes de reintentar
+🤖 <i>Ejecutado automáticamente desde GitHub Actions</i>
+            """.strip()
+            
+            self.send_telegram_message(summary_message)
 
 def main():
-    # Configuración
-    BOT_TOKEN = "TU_BOT_TOKEN_AQUI"  # Reemplaza con tu token
-    CHAT_ID = "TU_CHAT_ID_AQUI"      # Reemplaza con tu chat ID
+    # Configuración desde variables de entorno
+    BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+    CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+    
+    # Verificar configuración
+    if not BOT_TOKEN or not CHAT_ID:
+        logging.error("❌ Variables de entorno no configuradas:")
+        logging.error("TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID son requeridas")
+        exit(1)
     
     # Lista de acciones a monitorear
     STOCK_LIST = [
@@ -250,40 +225,35 @@ def main():
         "META",   # Meta
         "NFLX",   # Netflix
         "AMD",    # AMD
-        "INTC"    # Intel
+        "INTC",   # Intel
+        "SPY",    # S&P 500 ETF
+        "QQQ"     # NASDAQ ETF
     ]
     
-    # Parámetros de monitoreo
-    RSI_THRESHOLD = 30      # Umbral para alerta de sobreventa
-    CHECK_INTERVAL = 1800   # Chequear cada 30 minutos (1800 segundos)
+    RSI_THRESHOLD = 30
     
     # Crear instancia del monitor
     monitor = RSIMonitor(BOT_TOKEN, CHAT_ID)
     
-    # Verificar configuración
-    if not BOT_TOKEN or not CHAT_ID:
-        logging.error("❌ Variables de entorno no configuradas:")
-        logging.error("TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID son requeridas")
-        return
-    
-    # Enviar mensaje de inicio
-    start_message = f"""
-🚀 <b>Monitor RSI Iniciado</b>
-
-📋 <b>Acciones monitoreadas:</b> {len(STOCK_LIST)}
-📊 <b>Umbral RSI:</b> {RSI_THRESHOLD}
-⏱️ <b>Intervalo:</b> {CHECK_INTERVAL//60} minutos
-
-Recibirás alertas cuando el RSI(14) esté por debajo de {RSI_THRESHOLD}.
-    """.strip()
-    
-    monitor.send_telegram_message(start_message)
-    
-    # Iniciar monitoreo
     try:
-        monitor.monitor_stocks(STOCK_LIST, RSI_THRESHOLD, CHECK_INTERVAL)
+        # Ejecutar una sola verificación
+        monitor.run_single_check(STOCK_LIST, RSI_THRESHOLD)
+        logging.info("✅ Ejecución completada exitosamente")
+        
     except Exception as e:
-        logging.error(f"Error fatal: {e}")
+        logging.error(f"💥 Error fatal: {e}")
+        # Enviar notificación de error
+        error_message = f"""
+❌ <b>Error en RSI Monitor</b>
+
+🐛 <b>Error:</b> {str(e)}
+⏰ <b>Fecha:</b> {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+
+🤖 <i>GitHub Actions reportó un fallo</i>
+        """.strip()
+        
+        monitor.send_telegram_message(error_message)
+        exit(1)
 
 if __name__ == "__main__":
     main()
